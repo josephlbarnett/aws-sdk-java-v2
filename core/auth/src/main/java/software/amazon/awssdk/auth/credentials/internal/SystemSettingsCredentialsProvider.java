@@ -17,6 +17,7 @@ package software.amazon.awssdk.auth.credentials.internal;
 
 import static software.amazon.awssdk.utils.StringUtils.trim;
 
+import java.nio.file.Paths;
 import java.util.Optional;
 import software.amazon.awssdk.annotations.SdkInternalApi;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -24,9 +25,13 @@ import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.SystemPropertyCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.WebIdentityTokenCredentialsProviderFactory;
 import software.amazon.awssdk.core.SdkSystemSetting;
 import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.utils.IoUtils;
+import software.amazon.awssdk.utils.SdkAutoCloseable;
 import software.amazon.awssdk.utils.StringUtils;
 import software.amazon.awssdk.utils.SystemSetting;
 
@@ -42,33 +47,84 @@ import software.amazon.awssdk.utils.SystemSetting;
  * @see SystemPropertyCredentialsProvider
  */
 @SdkInternalApi
-public abstract class SystemSettingsCredentialsProvider implements AwsCredentialsProvider {
-    @Override
-    public AwsCredentials resolveCredentials() {
+public abstract class SystemSettingsCredentialsProvider implements AwsCredentialsProvider, SdkAutoCloseable {
+
+    private final AwsCredentialsProvider credentialsProvider;
+    private final RuntimeException loadException;
+
+    protected SystemSettingsCredentialsProvider() {
+        AwsCredentialsProvider credentialsProvider = null;
+        RuntimeException loadException = null;
+
         String accessKey = trim(loadSetting(SdkSystemSetting.AWS_ACCESS_KEY_ID).orElse(null));
         String secretKey = trim(loadSetting(SdkSystemSetting.AWS_SECRET_ACCESS_KEY).orElse(null));
         String sessionToken = trim(loadSetting(SdkSystemSetting.AWS_SESSION_TOKEN).orElse(null));
 
-        if (StringUtils.isEmpty(accessKey)) {
-            throw SdkClientException.builder()
-                                    .message(String.format("Unable to load credentials from system settings. Access key must be" +
-                                             " specified either via environment variable (%s) or system property (%s).",
-                                             SdkSystemSetting.AWS_ACCESS_KEY_ID.environmentVariable(),
-                                             SdkSystemSetting.AWS_ACCESS_KEY_ID.property()))
-                                    .build();
+        String roleArn = trim(loadSetting(SdkSystemSetting.AWS_ROLE_ARN).orElse(null));
+        String roleSessionName = trim(loadSetting(SdkSystemSetting.AWS_ROLE_SESSION_NAME).orElse(null));
+        String webIdentityTokenFile = trim(loadSetting(SdkSystemSetting.AWS_WEB_IDENTITY_TOKEN_FILE).orElse(null));
+
+        if (StringUtils.isNotBlank(webIdentityTokenFile)) {
+            if (StringUtils.isEmpty(roleArn)) {
+                loadException = SdkClientException.builder()
+                                                  .message(String.format("A web identity token file path has been specified " +
+                                                                         "without also specifiying a role arn. Please set the " +
+                                                                         "role arn environment variable (%s) or system property" +
+                                                                         " (%s) to use web identity tokens",
+                                                                         SdkSystemSetting.AWS_ROLE_ARN.environmentVariable(),
+                                                                         SdkSystemSetting.AWS_ROLE_ARN.property()))
+                                                  .build();
+            } else {
+                String webIdentityToken = WebIdentityCredentialsUtils.resolveWebIdentityToken(Paths.get(webIdentityTokenFile));
+                WebIdentityTokenCredentialsProviderFactory factory = WebIdentityCredentialsUtils.factory();
+                credentialsProvider = factory.create(roleArn, roleSessionName, webIdentityToken);
+            }
+        } else if (StringUtils.isNotBlank(roleArn)) {
+            loadException = SdkClientException.builder()
+                                              .message("Role can't be assumed via environment variables")
+                                              .build();
+        } else if (StringUtils.isEmpty(accessKey) || StringUtils.isEmpty(secretKey)) {
+            loadException = SdkClientException.builder()
+                                              .message(String.format("An access key and secret key must both be specified via " +
+                                                                     "their environment variables (%s) (%s) or system " +
+                                                                     "properties (%s) (%s)",
+                                                                     SdkSystemSetting.AWS_ACCESS_KEY_ID.environmentVariable(),
+                                                                     SdkSystemSetting.AWS_SECRET_ACCESS_KEY.environmentVariable(),
+                                                                     SdkSystemSetting.AWS_ACCESS_KEY_ID.property(),
+                                                                     SdkSystemSetting.AWS_SECRET_ACCESS_KEY.property()))
+                                              .build();
+        } else {
+            if (sessionToken != null) {
+                AwsSessionCredentials sessionCredentials = AwsSessionCredentials.create(accessKey, secretKey, sessionToken);
+                credentialsProvider = StaticCredentialsProvider.create(sessionCredentials);
+            } else {
+                credentialsProvider = StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey));
+            }
         }
 
-        if (StringUtils.isEmpty(secretKey)) {
-            throw SdkClientException.builder()
-                                    .message(String.format("Unable to load credentials from system settings. Secret key must be" +
-                                             " specified either via environment variable (%s) or system property (%s).",
-                                             SdkSystemSetting.AWS_SECRET_ACCESS_KEY.environmentVariable(),
-                                             SdkSystemSetting.AWS_SECRET_ACCESS_KEY.property()))
-                                    .build();
+        if (loadException != null) {
+            this.credentialsProvider = null;
+            this.loadException = loadException;
+        } else {
+            this.loadException = null;
+            this.credentialsProvider = credentialsProvider;
+        }
+    }
+
+    @Override
+    public AwsCredentials resolveCredentials() {
+        if (loadException != null) {
+            throw loadException;
         }
 
-        return sessionToken == null ? AwsBasicCredentials.create(accessKey, secretKey)
-                                    : AwsSessionCredentials.create(accessKey, secretKey, sessionToken);
+        return credentialsProvider.resolveCredentials();
+    }
+
+    @Override
+    public void close() {
+        // The delegate credentials provider may be closeable (eg. if it's an STS credentials provider). In this case, we should
+        // clean it up when this credentials provider is closed.
+        IoUtils.closeIfCloseable(credentialsProvider, null);
     }
 
     /**
