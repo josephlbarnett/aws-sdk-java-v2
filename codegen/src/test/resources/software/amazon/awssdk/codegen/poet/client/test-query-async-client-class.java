@@ -244,7 +244,8 @@ final class DefaultQueryAsyncClient implements QueryAsyncClient {
                     .withInput(streamingOutputOperationRequest), asyncResponseTransformer);
             executeFuture.whenComplete((r, e) -> {
                 if (e != null) {
-                    asyncResponseTransformer.exceptionOccurred(e);
+                    runAndLogError(log, "Exception thrown in exceptionOccurred callback, ignoring",
+                                   () -> asyncResponseTransformer.exceptionOccurred(e));
                 }
             });
             return executeFuture;
