@@ -152,7 +152,8 @@ public interface ProtocolSpec {
     default String streamingOutputWhenComplete(String responseHandlerName) {
         return String.format(".whenComplete((r, e) -> {%n"
                              + "     if (e != null) {%n"
-                             + "         runAndLogError(log, \"Exception thrown in exceptionOccurred callback, ignoring\", () -> %s.exceptionOccurred(e));%n"
+                             + "         runAndLogError(log, \"Exception thrown in exceptionOccurred callback, ignoring\", () "
+                             + "-> %s.exceptionOccurred(e));%n"
                              + "     }%n"
                              + "})", responseHandlerName);
 
